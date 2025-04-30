@@ -560,7 +560,7 @@ class FCSParser(object):
             else:
                 log_channels.append(channel_number)
                 # append type float to get correct linearised values
-                _dt.append((name,'<f4'))
+                _dt.append((name,numpy.dtype(numpy.float32).str))
                 msg=(u'Transforming data log to lin for channel {} '
                      u'using {} decades and minimum of {}.')
                 logger.info(msg.format(channel_number,decades,minimum))

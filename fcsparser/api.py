@@ -126,6 +126,7 @@ class FCSParser(object):
         channel_naming="$PnS",
         data_set=0,
         encoding="utf-8",
+        pne_scaling=False,
     ):
         """Parse FCS files.
 
@@ -189,6 +190,8 @@ class FCSParser(object):
         self.channel_numbers = []
         self._analysis = None
         self._file_size = 0
+
+        self._pne_scaling = pne_scaling
 
         if channel_naming not in ("$PnN", "$PnS"):
             raise ValueError('channel_naming must be either "$PnN" or "$PnS"')
@@ -492,7 +495,7 @@ class FCSParser(object):
 
         return channel_names
 
-    def _transform_log_to_lin(self,data,text,mixed_types):
+    def _transform_log_to_lin(self, data, text, mixed_types):
         """
         Transforms data from log to lin as given by $PnE parameter for each channel.
         Data is not transformed if $PnE is '0.0,0.0' or not valid.
@@ -697,9 +700,10 @@ class FCSParser(object):
                     dtype=data.dtype,
                 )
                 data &= valid_bits_per_par_list
-            # For data type integer data may be stored log scaled
-            # transform_log_to_lin performes transformation if necessary:
-            self._transform_log_to_lin(data,text,len(set(par_numeric_type_list)) > 1)
+            if self._pne_scaling:
+                self._transform_log_to_lin(data,text,len(set(par_numeric_type_list)) > 1)
+            else:
+                self._data = data
         else:
             self._data = data
 
@@ -782,6 +786,7 @@ def parse(
     data_set=0,
     dtype="float32",
     encoding="utf-8",
+    pne_scaling=True,
 ):
     """Parse an fcs file at the location specified by the path.
 
@@ -825,6 +830,9 @@ def parse(
         data, but should make follow up analysis safer in basically all cases.
     encoding: str
         Provide encoding type of the text section.
+    pne_scaling: bool
+        If True (default), data is transformed from log to lin scaling according to the
+        $PnE parameter.
 
 
     Returns
@@ -856,6 +864,7 @@ def parse(
         channel_naming=channel_naming,
         data_set=data_set,
         encoding=encoding,
+        pne_scaling=pne_scaling
     )
 
     if reformat_meta:

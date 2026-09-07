@@ -525,3 +525,89 @@ class TestHeaderParsing(unittest.TestCase):
         self.assertEqual(200, len(fcs_parser.annotation))
         # Check one hard-coded key
         self.assertEqual(fcs_parser.annotation['$P9B'], 32)
+
+
+def _fromfile_structured(file, dtype, count):
+    """The DATA reader `fromfile` replaced: one 'u1' field per byte of a record.
+
+    Kept here as the reference implementation. numpy 2.3 copies structured arrays
+    field by field, so on a large DATA segment this is far slower than the flat read.
+    """
+    dtypes = dtype.split(",")
+    field_widths = [int(dt[2:]) for dt in dtypes]
+    record_width = sum(field_widths)
+
+    try:
+        ret = numpy.fromfile(file, dtype=",".join(["u1"] * record_width), count=count)
+    except (TypeError, IOError):
+        ret = numpy.frombuffer(
+            file.read(count * record_width),
+            dtype=",".join(["u1"] * record_width),
+            count=count,
+        ).copy()
+    ret = ret.view("u1").reshape((count, record_width))
+
+    ret_dtypes = []
+    for field_idx, dt in enumerate(dtypes):
+        num_bytes = int(dt[2:])
+        while num_bytes & (num_bytes - 1) != 0:
+            ret = numpy.insert(
+                ret, sum(field_widths[0:field_idx]), numpy.zeros(count), axis=1
+            )
+            num_bytes = num_bytes + 1
+        ret_dtypes.append(dt[0] + dt[1] + str(num_bytes))
+    return ret.view(",".join(ret_dtypes)).ravel()
+
+
+class TestFlatDataRead(unittest.TestCase):
+    """The flat DATA reader must reproduce the structured one it replaced byte for byte.
+
+    A wrong reader produces a plausible array, not an error, so the per-file data
+    segment tests above would not necessarily notice a drift.
+    """
+
+    CASES = [
+        (",".join([">f4"] * 15), 4096),  # 15 float channels, big-endian
+        (",".join(["<f4"] * 11), 1000),  # little-endian, as most cytometers write
+        ("<u2,<u2,<u2", 777),  # 16-bit integer channels
+        (">u3,>u1", 64),  # non-power-of-two field width: the padding branch
+        (",".join(["<u2"] * 8 + ["<u4", "<u1"]), 725),  # cyflow cube 8 mixed record
+        (">f4", 1),  # one event, one channel
+    ]
+
+    def test_flat_read_matches_structured_read(self):
+        from io import BytesIO
+
+        from ..api import fromfile
+
+        for dtype, count in self.CASES:
+            with self.subTest(dtype=dtype, count=count):
+                record_width = sum(int(dt[2:]) for dt in dtype.split(","))
+                payload = (
+                    numpy.random.default_rng(7)
+                    .integers(0, 256, size=count * record_width, dtype=numpy.uint8)
+                    .tobytes()
+                )
+
+                expected = _fromfile_structured(BytesIO(payload), dtype, count)
+                actual = fromfile(BytesIO(payload), dtype, count)
+
+                self.assertEqual(actual.dtype, expected.dtype)
+                self.assertEqual(actual.shape, expected.shape)
+                # Compare bytes, not values: a NaN does not compare equal to itself.
+                self.assertEqual(actual.tobytes(), expected.tobytes())
+
+    def test_flat_read_from_path(self):
+        """The `numpy.fromfile` branch, on a real file rather than a BytesIO."""
+        from ..api import fromfile
+
+        fname = FILE_IDENTIFIER_TO_PATH['mq fcs 3.0']
+        parser = FCSParser(path=fname, read_data=False)
+        count = parser.annotation['$TOT'] * parser.annotation['$PAR']
+        with open(fname, 'rb') as f:
+            f.seek(parser._data_start)
+            expected = _fromfile_structured(f, '<f4', count)
+        with open(fname, 'rb') as f:
+            f.seek(parser._data_start)
+            actual = fromfile(f, '<f4', count)
+        self.assertEqual(actual.tobytes(), expected.tobytes())

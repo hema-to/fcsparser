@@ -42,11 +42,11 @@ def fromfile(file, dtype, count, *args, **kwargs):
     # records in their DATA segment in three-byte-wide integers --
     # this comes in as a dtype of "i3", which makes numpy freak out.
 
-    # To address this, we convert the requested dtype so that each
-    # record is read as a series of one-byte-wide unsigned integers
-    # ('u1'), pad out each record with NUL bytes until it is
-    # a power-of-two wide, then re-convert it to the requested
-    # dtype (but with a power-of-two width) and return it.
+    # To address this, we read each record as a series of one-byte-wide
+    # unsigned integers ('u1'), lay the bytes of every field into a slot
+    # that is a power-of-two wide, padding with NUL bytes on the side that
+    # holds the most significant byte, and then view the result as the
+    # requested dtypes (with power-of-two widths).
 
     # what dtypes were we asked for?
     dtypes = dtype.split(",")
@@ -87,30 +87,25 @@ def fromfile(file, dtype, count, *args, **kwargs):
 
     ret = ret.reshape((count, record_width))
 
-    # now, for each requested dtype.....
-    ret_dtypes = []
-    for field_idx, dt in enumerate(dtypes):
-        dtype_type = dt[1]
-        dtype_endian = dt[0]
-        num_bytes = int(dt[2:])
+    # widen every field to the next power of two. `1 << (n - 1).bit_length()`
+    # is n itself when n already is a power of two.
+    padded_widths = [1 << (width - 1).bit_length() for width in field_widths]
 
-        # num_bytes & (num_bytes - 1) is 0 IFF num_bytes is a power of two
-        # while num_bytes is NOT a power of two....
-        while num_bytes & (num_bytes - 1) != 0:
-            # ...insert another COLUMN of NUL bytes at the front of the field....
-            ret = numpy.insert(
-                ret, sum(field_widths[0:field_idx]), numpy.zeros(count), axis=1
-            )
+    if padded_widths != field_widths:
+        padded = numpy.zeros((count, sum(padded_widths)), dtype="u1")
+        src = 0
+        dst = 0
+        for dt, width, padded_width in zip(dtypes, field_widths, padded_widths):
+            # the NUL bytes must land on the most-significant side: in front of
+            # a big-endian field, behind a little-endian one.
+            offset = padded_width - width if dt[0] == ">" else 0
+            padded[:, dst + offset : dst + offset + width] = ret[:, src : src + width]
+            src += width
+            dst += padded_width
+        ret = padded
 
-            # ....and increment the number of bytes for this field.
-            num_bytes = num_bytes + 1
-
-        # when we've got a field that's a power-of-two wide, append that field's
-        # dtype to the list of record dtypes we're going to return
-        ret_dtypes.append(dtype_endian + dtype_type + str(num_bytes))
-
-    # now, "cast" the newly padded array as the desired data types,
-    # and return it.
+    # now, "cast" the padded array as the desired data types, and return it.
+    ret_dtypes = [dt[:2] + str(width) for dt, width in zip(dtypes, padded_widths)]
     return ret.view(",".join(ret_dtypes)).ravel()
 
 

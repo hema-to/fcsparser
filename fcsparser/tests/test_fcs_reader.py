@@ -1,4 +1,5 @@
 import os
+import struct
 import timeit
 import unittest
 
@@ -525,3 +526,121 @@ class TestHeaderParsing(unittest.TestCase):
         self.assertEqual(200, len(fcs_parser.annotation))
         # Check one hard-coded key
         self.assertEqual(fcs_parser.annotation['$P9B'], 32)
+
+
+
+def _pack_records(rng, dtype, count):
+    """Random field values for `dtype`, and the DATA bytes that encode them.
+
+    Integers are drawn over the full width of the field so every byte is exercised;
+    floats are drawn finite so they round-trip exactly through the f4/f8 encoding.
+    """
+    fields = dtype.split(",")
+    columns = []
+    for field in fields:
+        endian, kind, width = field[0], field[1], int(field[2:])
+        if kind == "u":
+            columns.append([int(v) for v in rng.integers(0, 256**width, size=count)])
+        elif kind == "f":
+            code = {4: "f", 8: "d"}[width]
+            values = rng.normal(0, 1e4, size=count)
+            columns.append(
+                [struct.unpack(endian + code, struct.pack(endian + code, v))[0] for v in values]
+            )
+        else:
+            raise ValueError(field)
+    payload = bytearray()
+    for row in zip(*columns):
+        for field, value in zip(fields, row):
+            endian, kind, width = field[0], field[1], int(field[2:])
+            byteorder = "big" if endian == ">" else "little"
+            if kind == "u":
+                payload += value.to_bytes(width, byteorder)
+            else:
+                payload += struct.pack(endian + {4: "f", 8: "d"}[width], value)
+    return columns, bytes(payload)
+
+
+class TestDataRead(unittest.TestCase):
+    """`fromfile` must return the values the DATA bytes encode.
+
+    A wrong reader produces a plausible array, not an error, so the per-file data
+    segment tests above would not necessarily notice. The cases with 3-, 5- and 7-byte
+    fields exercise the padding to a power-of-two width, on both sides of the record,
+    in both byte orders, and with more than one padded field per record.
+    """
+
+    CASES = [
+        (",".join([">f4"] * 15), 4096),  # 15 float channels, big-endian
+        (",".join(["<f4"] * 11), 1000),  # little-endian, as most cytometers write
+        ("<f8,<f8", 100),  # double precision
+        ("<u2,<u2,<u2", 777),  # 16-bit integer channels
+        (",".join(["<u2"] * 8 + ["<u4", "<u1"]), 725),  # the cyflow cube 8 record
+        (">u3", 64),  # the Cytek xP5 record: 3-byte fields, big-endian
+        ("<u3", 64),  # 3-byte fields, little-endian
+        (">u3,>u3", 64),  # two padded fields in one record
+        ("<u3,<u3", 64),
+        (">u3,>u1", 64),  # padded field before an unpadded one
+        (">u1,>u3", 64),  # and after
+        ("<u2,<u3,<f4", 64),  # padded field between unpadded ones
+        (">u5,>u7,<u6", 16),  # padding by more than one byte
+        (">f4", 1),  # one event, one channel
+        (">f4,>f4", 0),  # no events
+    ]
+
+    def test_fromfile_returns_the_encoded_values(self):
+        from io import BytesIO
+
+        from ..api import fromfile
+
+        rng = numpy.random.default_rng(7)
+        for dtype, count in self.CASES:
+            with self.subTest(dtype=dtype, count=count):
+                columns, payload = _pack_records(rng, dtype, count)
+
+                actual = fromfile(BytesIO(payload), dtype, count)
+
+                fields = dtype.split(",")
+                self.assertEqual(actual.shape, (count,))
+                # A one-field dtype comes back as a plain array, not a one-field record.
+                if actual.dtype.names is None:
+                    self.assertEqual(len(fields), 1)
+                    actual_fields = [actual]
+                else:
+                    self.assertEqual(len(actual.dtype.names), len(fields))
+                    actual_fields = [actual[name] for name in actual.dtype.names]
+                for index, (field, column, values) in enumerate(
+                    zip(fields, columns, actual_fields)
+                ):
+                    padded_width = 1 << (int(field[2:]) - 1).bit_length()
+                    self.assertEqual(values.dtype.itemsize, padded_width)
+                    self.assertEqual(values.dtype.kind, field[1])
+                    assert_array_equal(
+                        values,
+                        numpy.array(column, dtype=values.dtype),
+                        err_msg="field {} of {}".format(index, dtype),
+                    )
+
+    def test_fromfile_on_a_truncated_stream_raises(self):
+        from io import BytesIO
+
+        from ..api import fromfile
+
+        with self.assertRaises(ValueError):
+            fromfile(BytesIO(bytes(16)), ">f4,>f4", 3)
+
+    def test_fromfile_from_a_real_file_returns_the_raw_bytes(self):
+        """The `numpy.fromfile` branch: a power-of-two dtype must yield the DATA bytes as is."""
+        from ..api import fromfile
+
+        fname = FILE_IDENTIFIER_TO_PATH['mq fcs 3.0']
+        parser = FCSParser(path=fname, read_data=False)
+        count = parser.annotation['$TOT'] * parser.annotation['$PAR']
+        with open(fname, 'rb') as f:
+            f.seek(parser._data_start)
+            raw = f.read(count * 4)
+        with open(fname, 'rb') as f:
+            f.seek(parser._data_start)
+            actual = fromfile(f, '<f4', count)
+        self.assertEqual(actual.dtype, numpy.dtype('<f4'))
+        self.assertEqual(actual.tobytes(), raw)
